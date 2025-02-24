@@ -23,7 +23,7 @@ from absl import app, flags, logging
 
 import objax
 from objax.typing import JaxArray
-from imagenet import imagenet_data
+from imagenet import imagenet_data, util
 from objax.zoo.resnet_v2 import ResNet18, ResNet50, ResNet101, ResNet152, ResNet200
 from objax.zoo.wide_resnet import WideResNet
 
@@ -53,6 +53,7 @@ flags.DEFINE_string('dataset', 'imagenet', 'Dataset to use')
 flags.DEFINE_boolean('disable_dp', False, 'If true then train without DP.')
 flags.DEFINE_float('dp_sigma', 0.00001, 'DP noise multiplier.')
 flags.DEFINE_float('dp_clip_norm', 1.0, 'DP gradient clipping norm.')
+flags.DEFINE_string('logit_clip', 'none', 'Clip function to use for logits: "none", "blf", or "tanh"')
 
 flags.DEFINE_float('dp_delta', 1e-6, 'DP-SGD delta for eps computation.')
 
@@ -204,6 +205,9 @@ class Experiment:
         self.save_summaries = bool(FLAGS.model_dir)
         self.lr_warmup_epochs = FLAGS.lr_warmup_epochs
         self.num_train_epochs = FLAGS.num_train_epochs
+
+        self.logit_clip_fn = util.construct_logit_clip_fn(FLAGS.logit_clip)
+
         # Dataset
         self.train_split = imagenet_data.get_train_dataset_split(FLAGS.dataset)
         self.eval_split = imagenet_data.get_eval_dataset_split(FLAGS.dataset)
@@ -298,7 +302,8 @@ class Experiment:
           Tuple (total_loss, losses_dictionary).
         """
         logits = self.model(images, training=True)
-        xent_loss = objax.functional.loss.cross_entropy_logits_sparse(logits, labels).mean()
+        logits_clipped = self.logit_clip_fn(logits)
+        xent_loss = objax.functional.loss.cross_entropy_logits_sparse(logits_clipped, labels).mean()
         wd_loss = FLAGS.weight_decay * 0.5 * sum((v.value ** 2).sum()
                                                  for k, v in self.trainable_vars.items()
                                                  if k.endswith('.w'))
