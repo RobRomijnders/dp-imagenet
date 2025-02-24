@@ -1,0 +1,5 @@
+jax[cuda12]
+absl
+objax
+tensorflow
+tensorflow-datasets
