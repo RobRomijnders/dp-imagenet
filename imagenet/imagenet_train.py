@@ -16,7 +16,6 @@
 
 import os
 import time
-
 import jax
 import jax.numpy as jn
 import numpy as np
@@ -28,17 +27,17 @@ from imagenet import imagenet_data
 from objax.zoo.resnet_v2 import ResNet18, ResNet50, ResNet101, ResNet152, ResNet200
 from objax.zoo.wide_resnet import WideResNet
 
-flags.DEFINE_string('model_dir', '', 'Model directory.')
+flags.DEFINE_string('model_dir', '/tmp/model_dir', 'Model directory.')
 flags.DEFINE_integer('keep_ckpts', 4, 'Number of checkpoints to keep.')
 flags.DEFINE_integer('train_device_batch_size', 128, 'Per-device training batch size.')
 flags.DEFINE_integer('grad_acc_steps', 1,
                      'Number of steps for gradients accumulation, used to simulate large batches.')
 flags.DEFINE_integer('eval_device_batch_size', 250, 'Per-device eval batch size.')
-flags.DEFINE_integer('max_eval_batches', -1, 'Maximum number of batches used for evaluation, '
+flags.DEFINE_integer('max_eval_batches', 5, 'Maximum number of batches used for evaluation, '
                                              'zero or negative number means use all batches.')
 flags.DEFINE_integer('eval_every_n_steps', 1000, 'How often to run eval.')
 flags.DEFINE_float('num_train_epochs', 10, 'Number of training epochs.')
-flags.DEFINE_float('base_learning_rate', 2.0, 'Base learning rate.')
+flags.DEFINE_float('base_learning_rate', 2.0, 'Base learning rate.')  # 2.0 for standard Momentum training
 flags.DEFINE_float('lr_warmup_epochs', 1.0,
                    'Number of learning rate warmup epochs.')
 flags.DEFINE_string('lr_schedule', 'cos', 'Learning rate schedule: "cos" or "fixed"')
@@ -59,7 +58,7 @@ flags.DEFINE_float('dp_delta', 1e-6, 'DP-SGD delta for eps computation.')
 
 flags.DEFINE_string('finetune_path', '',
                     'Path to checkpoint which is used as finetuning initialization.')
-flags.DEFINE_boolean('finetune_cut_last_layer', True,
+flags.DEFINE_boolean('finetune_cut_last_layer', False,
                      'If True then last layer will be cut for finetuning.')
 flags.DEFINE_integer('num_layers_to_freeze', 0, 'Number of layers to freeze for finetuning.')
 
@@ -85,51 +84,92 @@ class GradientAccumulationOptimizerWrapper(objax.Module):
                 a.value = jn.zeros_like(a.value)
 
 
-class CustomResnet(objax.zoo.resnet_v2.ResNetV2):
-  """Implementation of custom ResNet v2."""
+from objax.module import Module, ModuleList
+from objax.variable import TrainVar, StateVar, TrainRef
+from typing import List, Optional
 
-  def __init__(self,
-               name: str,
-               in_channels: int,
-               num_classes: int):
-    """Creates custom resnet instance.
+class CustomSGLD(Module):
+    """Stochastic Gradient Langevin Dynamics (SGLD) optimizer."""
 
-    Args:
-        name: resnet name
-        in_channels: number of channels in the input image.
-        num_classes: number of output classes.
-    """
-    # Name syntax:
-    # "rn_cX_bA_B_C_D" - resnet without bottleneck
-    # "rnb_cX_bA_B_C_D" - resnet with bottleneck
-    # X - number of channels, (A, B, C, D) - number of blocks per group
-    # parsing the name
-    assert name.startswith('rn_c') or name.startswith('rnb_c')
-    bottleneck = name.startswith('rnb_')
-    name = name[name.find('_')+2:]
-    num_ch, name = name.split('_', 1)
-    num_ch = int(num_ch)
-    assert name.startswith('b')
-    blocks_per_group = list(int(b) for b in name[1:].split('_'))
-    assert len(blocks_per_group) == 4
-    super().__init__(in_channels=in_channels,
-                     num_classes=num_classes,
-                     blocks_per_group=blocks_per_group,
-                     bottleneck=bottleneck,
-                     channels_per_group=(num_ch, num_ch*2, num_ch*4, num_ch*8),
-                     group_use_projection=(True, True, True, True),
-                     normalization_fn=objax.nn.GroupNorm2D,
-                     activation_fn=objax.functional.relu)
+    def __init__(self, vc):
+        """Constructor for SGLD optimizer.
+
+        Args:
+            vc: collection of variables to optimize.
+        """
+        self.train_vars = ModuleList(TrainRef(x) for x in vc.subset(TrainVar))
+
+        self.rng = jax.random.key(42)
+
+    def __call__(self, step_size: float, grads: List[objax.typing.JaxArray]):
+        """Updates variables using SGLD.
+
+        Args:
+            lr: the learning rate.
+            grads: the gradients to apply.
+            rng: random key for noise generation.
+        """
+        assert len(grads) == len(self.train_vars), 'Mismatch between gradients and variables'
+
+        for g, p in zip(grads, self.train_vars):
+            new_key, subkey = jax.random.split(self.rng)
+            noise = jax.random.normal(subkey, shape=p.value.shape)
+            self.rng = new_key
+
+            # Grad is already calculated as mean() over batch size, so multiply by train_size here
+            p.value -= 1281167 * step_size * g + (noise * jn.sqrt(2 * step_size))
+
+    def __repr__(self):
+        return f'{objax.util.class_name(self)}'
+
+
+class CustomPreconditionedSGLD(Module):
+    """Preconditioned Stochastic Gradient Langevin Dynamics (Pre-SGLD) optimizer."""
+
+    def __init__(self, vc):
+        """Constructor for Pre-SGLD optimizer.
+
+        Args:
+            vc: collection of variables to optimize.
+        """
+        self.train_vars = ModuleList(TrainRef(x) for x in vc.subset(TrainVar))
+
+        self.alpha = StateVar(jn.array(0.95))  # Momentum parameter
+        self.lambda_small = StateVar(jn.array(1e-8))  # Small constant for numeric stability
+
+        self.momentum_vars = ModuleList(StateVar(jn.zeros_like(x.value)) for x in self.train_vars)
+
+        self.rng = jax.random.key(42)
+
+    def __call__(self, step_size: float, grads: List[objax.typing.JaxArray]):
+        """Updates variables using SGLD.
+
+        Args:
+            lr: the learning rate.
+            grads: the gradients to apply.
+            rng: random key for noise generation.
+        """
+        assert len(grads) == len(self.train_vars), 'Mismatch between gradients and variables'
+
+        for g, p, m in zip(grads, self.train_vars, self.momentum_vars):
+            new_key, subkey = jax.random.split(self.rng)
+            noise = jax.random.normal(subkey, shape=p.value.shape)
+            self.rng = new_key
+
+            # Update momentum_vars
+            m.value = self.alpha.value * m.value + (1 - self.alpha.value) * jn.square(g)
+            velocity = jn.reciprocal(jn.sqrt(m.value) + self.lambda_small.value)
+
+            # Grad is already calculated as mean() over batch size, so multiply by train_size here
+            p.value -= (1281167 * velocity * step_size * g) + noise * jn.sqrt(2 * step_size * velocity)
+
+    def __repr__(self):
+        return f'{objax.util.class_name(self)}'
+
 
 
 def make_model(model_name, num_classes):
   model_name = model_name.lower()
-  if model_name.startswith('rn'):
-    return CustomResnet(model_name, in_channels=3, num_classes=num_classes)
-  if model_name.startswith('wrn'):
-    # syntax is 'wrn_D_W' where D - depth, W - width
-    d, w = (int(val) for val in model_name.split('_')[1:])
-    return WideResNet(nin=3, nclass=num_classes, depth=d, width=w, bn=objax.nn.GroupNorm2D)
   if model_name == 'resnet200':
     return ResNet200(in_channels=3,
                      num_classes=num_classes,
@@ -189,6 +229,12 @@ class Experiment:
             self.optimizer = objax.optimizer.Momentum(self.trainable_vars, momentum=0.9, nesterov=True)
         elif FLAGS.optimizer == 'adam':
             self.optimizer = objax.optimizer.Adam(self.trainable_vars)
+        elif FLAGS.optimizer == 'sgld':
+            print(f'Using SGLD optimizer with learning rate {self.base_learning_rate}')
+            self.optimizer = CustomSGLD(self.trainable_vars)
+        elif FLAGS.optimizer == 'psgld':
+            print(f'Using Pre-SGLD optimizer with learning rate {self.base_learning_rate}')
+            self.optimizer = CustomPreconditionedSGLD(self.trainable_vars)
         else:
             raise ValueError(f'Unsupported optimizer: {FLAGS.optimizer}')
         if FLAGS.grad_acc_steps > 1:
@@ -256,6 +302,7 @@ class Experiment:
         wd_loss = FLAGS.weight_decay * 0.5 * sum((v.value ** 2).sum()
                                                  for k, v in self.trainable_vars.items()
                                                  if k.endswith('.w'))
+                                                # if not k.endswith('.gamma'))
         total_loss = xent_loss + wd_loss
         return total_loss, {'total_loss': total_loss,
                             'xent_loss': xent_loss,
@@ -268,14 +315,14 @@ class Experiment:
             cos_decay_epochs = self.num_train_epochs - self.lr_warmup_epochs
             lr_multiplier = jn.where(
               epoch < self.lr_warmup_epochs,
-              x=epoch / self.lr_warmup_epochs,
-              y=0.5 * (1 + jn.cos(jn.pi * (epoch - self.lr_warmup_epochs) / cos_decay_epochs))
+              epoch / self.lr_warmup_epochs,
+              0.5 * (1 + jn.cos(jn.pi * (epoch - self.lr_warmup_epochs) / cos_decay_epochs))
             )
         elif FLAGS.lr_schedule == 'fixed':
             lr_multiplier = jn.where(
               epoch < self.lr_warmup_epochs,
-              x=epoch / self.lr_warmup_epochs,
-              y=1.0)
+              epoch / self.lr_warmup_epochs,
+              1.0)
         else:
             raise ValueError(f'Unsupported LR schedule: {FLAGS.lr_schedule}')
         return self.base_learning_rate * lr_multiplier
@@ -329,6 +376,10 @@ class Experiment:
                   FLAGS.finetune_path,
                   self.model.vars())
 
+        with self.all_vars.replicate():
+            acc_eval_pretraining = self.run_eval()
+        print(f'Accuracy before training: {acc_eval_pretraining * 100:.2f}', flush=True)
+
         cur_epoch = np.zeros([jax.local_device_count()], dtype=np.float32)
         total_training_time = 0.0
         train_time_per_epoch = 0.0
@@ -367,21 +418,27 @@ class Experiment:
                 # In multi-host setup only first host saves summaries and checkpoints.
                 if jax.host_id() == 0:
                     # save summary
-                    summary = objax.jaxboard.Summary()
-                    for k, v in monitors.items():
-                        summary.scalar(f'train/{k}', v)
-                    if dp_epsilon is not None:
-                        summary.scalar('dp/epsilon', dp_epsilon)
-                        summary.scalar('dp/delta', FLAGS.dp_delta)
-                    summary.scalar('test/accuracy', accuracy * 100)
-                    self.summary_writer.write(summary, step=int(cur_step / FLAGS.grad_acc_steps))
+                    if False:
+                        summary = objax.jaxboard.Summary()
+                        for k, v in monitors.items():
+                            summary.scalar(f'train/{k}', v)
+                        if dp_epsilon is not None:
+                            summary.scalar('dp/epsilon', dp_epsilon)
+                            summary.scalar('dp/delta', FLAGS.dp_delta)
+                        summary.scalar('test/accuracy', accuracy * 100)
+                        self.summary_writer.write(summary, step=int(cur_step / FLAGS.grad_acc_steps))
                     # save checkpoint
+                    print(f"At step {cur_step} saving checkpoint to {checkpoint.logdir}")
                     checkpoint.save(self.all_vars, cur_step)
             # print info
+            l2_norm = np.sqrt(sum((v.value ** 2).sum() for v in self.trainable_vars.values()))
+            momentum_l2_norm = 0.0
+            if FLAGS.optimizer == 'psgld':
+                momentum_l2_norm = np.sqrt(sum(v.value.sum() for v in self.optimizer.momentum_vars))
             print(f'Step {cur_step} -- '
                   f'Epoch {cur_step / steps_per_epoch:.2f} -- '
-                  f'Loss {monitors["total_loss"]:.2f}  '
-                  f'Accuracy {accuracy * 100:.2f}')
+                  f'Loss {monitors["total_loss"]:.2f} (ll[{monitors["xent_loss"]:.2f}] / wd[{monitors["wd_loss"]:.2f}]) '
+                  f'EvalAccuracy {accuracy * 100:.2f} -- L2 norm of weights: {l2_norm:.2f}, momentum {momentum_l2_norm:.2f}')
             if dp_epsilon is not None:
                 print(f'    DP: ε={dp_epsilon:.2f}  δ={FLAGS.dp_delta}')
             print(f'    Training took {elapsed_train_time:.1f} seconds, '
@@ -393,8 +450,7 @@ class Experiment:
 def main(argv):
     del argv
     print('JAX host: %d / %d' % (jax.process_index(), jax.process_count()))
-    print('JAX devices:\n%s' % '\n'.join(str(d) for d in jax.devices()),
-          flush=True)
+    print('JAX devices:\n%s' % '\n'.join(str(d) for d in jax.devices()), flush=True)
     if FLAGS.rnd_seed is not None:
         rnd_seed = FLAGS.rnd_seed
     else:

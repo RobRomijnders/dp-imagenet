@@ -1,4 +1,10 @@
 
+
+python imagenet/imagenet_train.py --tfds_data_dir="/home/rob/Documents/datasets/imagenet" --max_eval_batches=10 --eval_every_n_steps=100 --model=resnet18  --disable_dp --finetune_path=/home/rob/Documents/projects/dp-imagenet/saved_models/2025-02-19__baselearningrate0-1.npz --optimizer=sgld --train_device_batch_size=256 --base_learning_rate= 0.0000000002
+
+python imagenet/imagenet_train.py --tfds_data_dir="/home/rob/Documents/datasets/imagenet" --max_eval_batches=5 --eval_every_n_steps=500 --model=resnet18  --disable_dp --finetune_path=/home/rob/Documents/projects/dp-imagenet/finetuned_models/places365_resnet18_20220314.npz --base_learning_rate=0.1 --train_device_batch_size=256 --model_dir=/home/rob/Documents/projects/dp-imagenet/saved_models/baselearningrate__$RANDOM --num_train_epochs=25 --finetune_cut_last_layer=True
+
+
 # Differentially private Imagenet training
 
 Code for the tech report [Toward Training at ImageNet Scale with Differential Privacy](https://arxiv.org/abs/2201.12328)
