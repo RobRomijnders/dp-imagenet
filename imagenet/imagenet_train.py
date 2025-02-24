@@ -32,10 +32,10 @@ flags.DEFINE_integer('keep_ckpts', 4, 'Number of checkpoints to keep.')
 flags.DEFINE_integer('train_device_batch_size', 128, 'Per-device training batch size.')
 flags.DEFINE_integer('grad_acc_steps', 1,
                      'Number of steps for gradients accumulation, used to simulate large batches.')
-flags.DEFINE_integer('eval_device_batch_size', 128, 'Per-device eval batch size.')
+flags.DEFINE_integer('eval_device_batch_size', 250, 'Per-device eval batch size.')
 flags.DEFINE_integer('max_eval_batches', 5, 'Maximum number of batches used for evaluation, '
                                              'zero or negative number means use all batches.')
-flags.DEFINE_integer('eval_every_n_steps', 500, 'How often to run eval.')
+flags.DEFINE_integer('eval_every_n_steps', 1000, 'How often to run eval.')
 flags.DEFINE_float('num_train_epochs', 10, 'Number of training epochs.')
 flags.DEFINE_float('base_learning_rate', 2.0, 'Base learning rate.')  # 2.0 for standard Momentum training
 flags.DEFINE_float('lr_warmup_epochs', 1.0,
@@ -301,8 +301,8 @@ class Experiment:
         xent_loss = objax.functional.loss.cross_entropy_logits_sparse(logits, labels).mean()
         wd_loss = FLAGS.weight_decay * 0.5 * sum((v.value ** 2).sum()
                                                  for k, v in self.trainable_vars.items()
-                                                #  if k.endswith('.w'))
-                                                if not k.endswith('.gamma'))
+                                                 if k.endswith('.w'))
+                                                # if not k.endswith('.gamma'))
         total_loss = xent_loss + wd_loss
         return total_loss, {'total_loss': total_loss,
                             'xent_loss': xent_loss,
@@ -399,7 +399,6 @@ class Experiment:
                         batch['labels'],
                         cur_epoch,
                         apply_updates)
-                    # self.train_op(batch['images'], batch['labels'], cur_epoch, apply_updates)
                 elapsed_train_time = time.time() - start_time
                 total_training_time += elapsed_train_time
                 train_time_per_epoch = total_training_time / cur_epoch[0]
